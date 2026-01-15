@@ -10,7 +10,10 @@ import com.rewardly.bonus.config.FeignConfig;
 import com.rewardly.bonus.dto.EmployeeDto;
 
 @FeignClient(name = "employee-service",
-			configuration = FeignConfig.class )
+			configuration = FeignConfig.class,
+			url = "${spring.cloud.openfeign.client.config.employee-service.url}"
+			//fallback = EmployeeServiceFallback.class
+			)
 public interface EmployeeServiceClient {
 	
 	/**

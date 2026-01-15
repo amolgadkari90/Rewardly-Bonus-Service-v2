@@ -24,20 +24,24 @@ import com.rewardly.bonus.exception.EmployeeNotFoundException;
 import com.rewardly.bonus.mapper.BonusMapper;
 import com.rewardly.bonus.repository.BonusRepository;
 
+import feign.FeignException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 @Service
-@Transactional
 @Slf4j
-@RequiredArgsConstructor 
-
+@RequiredArgsConstructor
 public class BonusServiceImpl implements BonusService {
 	//Constants 
 	private static final BigDecimal ONE_HUNDRED = BigDecimal.valueOf(100);	
 	private static final BigDecimal TWO_LAKH = BigDecimal.valueOf(200_000);
 	private static final BigDecimal ONE_LAKH = BigDecimal.valueOf(100_000);
-	
+	private static final String BONUS_CALC_ERROR = "BONUS_CALCULATION_ERROR";
+	private static final String INVALID_EMPLOYEE_ID = "INVALID_EMPLOYEE_ID";
+	private static final String INVALID_SALARY = "INVALID_SALARY";
+	private static final String DUPLICATE_BONUS= "DUPLICATE_BONUS";
+	private static final String MISSING_PERFORMANCE_RATING = "MISSING_PERFORMANCE_RATING";
+		
 	//Compiler level dependency injection
 	private final BonusRepository bonusRepository;
 	private final BonusMapper bonusMapper;
@@ -48,6 +52,7 @@ public class BonusServiceImpl implements BonusService {
 	
 		
 	@Override
+	@Transactional	
 	public BonusDto calculateAndSaveBonus(String empId) {
 		/*
 		 * 1. Check if empId is valid? No: throw BonusCalculationException
@@ -63,26 +68,28 @@ public class BonusServiceImpl implements BonusService {
 		 * 11. Map savedBonus to bonusDto object -> + Add empName to bonusDto
 		 * 12. Return bonusDto
 		 * */
-		log.info("Starting bonus calculations for empId= {} ", empId);
+		log.info("Starting bonus calculations for empId= {} ", maskEmployeeId(empId));
 		
-		if(empId == null || empId.isBlank()) {
-			log.error("Employee id is null/blank = {}",empId);
-			throw new BonusCalculationException("Employee id cann't be null or empty!...");
+		//Validate employee id
+		validateEmployeeId(empId);
+		
+		//Idempotency check - prevent duplicate bonus calculations for the same day
+		if(bonusRepository.existsByEmployeeIdAndBonusDate(empId, LocalDate.now())) {
+			log.warn("Bonus already calculated today for empId: {}", maskEmployeeId(empId));
+			throw new BonusCalculationException(DUPLICATE_BONUS, 
+					" Bonus has already been calculated for this employee today");
 		}
+		
+		//Fetch employee details
 		EmployeeDto employeeDto = fetchEmployee(empId);	
-		//Salary
-		BigDecimal empSalary = employeeDto.getEmpSalary();
-		if(empSalary == null || 
-				empSalary.compareTo(BigDecimal.ZERO) <= 0) {
-			log.error("Invalid employee salary for empId = {}", empId);
-			throw new BonusCalculationException("Invalid employee salary!...");
-		}	
+		
+		//Validate salary
+		BigDecimal empSalary = validateAndGetSalary(employeeDto, empId);
 
-		//Experience 
+		//Extract employee details
+		//Experience, Designation, Performance rating
 		int empExperienceYears = employeeDto.getEmpExperienceYears().intValue();		
-		// Designation 
 		String empDesignation = employeeDto.getEmpDesignation();
-		//Performance 
 		Integer empPerformanceRating = employeeDto.getEmpPerformanceRating();
 		
 		log.debug("Employee data fetched | salary = {} | Experience = {} | Designation = {} | Rating = {}"
@@ -116,45 +123,76 @@ public class BonusServiceImpl implements BonusService {
 		//Calculate bonus percentage
 		BigDecimal bonusPercentage =  calculateBonusPercentage(empSalary, totalBonusBeforeTax );
 		log.debug("Bonus percentage calculated: {}%",bonusPercentage);
-		//Build Bonus entity/object
 		
-		Bonus bonus = Bonus.builder()
-							.employeeId(empId)
-							.experienceBonus(experienceBonus)
-							.designationBonus(designationBonus)
-							.performanceBonus(perormanceBonus)
-							.totalBonusBeforeTax(totalBonusBeforeTax)
-							.taxDeducted(taxAmount)
-							.netBonus(netBonus)
-							.bonusPercentage(bonusPercentage)
-							.bonusDate(LocalDate.now())
-							.build();
+		//Build and save bonus entity/object
+		Bonus bonus = buildBonusEntity( empId, experienceBonus, designationBonus, perormanceBonus,
+				totalBonusBeforeTax, taxAmount, netBonus, bonusPercentage	);
 		
 		//Save bonus object to DB		
 		Bonus savedBonus = bonusRepository.save(bonus);
-		log.info("Bonus saved successfully | bonusId = {} | empId = {} ", savedBonus.getBonusId(), savedBonus.getEmployeeId());
+		log.info("Bonus saved successfully | bonusId = {} | empId = {} ", savedBonus.getBonusId(), maskEmployeeId(savedBonus.getEmployeeId()));
 		
-		//Map savedBonus to bonusDto object -> + Add empName to bonusDto
-		
+		//Map savedBonus to bonusDto object -> + Add empName to bonusDto		
 		BonusDto bonusDto = bonusMapper.toDto(savedBonus);
 		bonusDto.setEmpName(employeeDto.getEmpName());
 		
 		return bonusDto; // Returning bonusDto
 	}
 
+
+
+	//Validate employee id format and contents
+	private void validateEmployeeId(String empId) {
+		
+		if(empId == null || empId.trim().isEmpty()) {
+			log.error("Employee id is null/blank: ");
+			throw new BonusCalculationException(
+					INVALID_EMPLOYEE_ID, " Employee id can not be null/empty");					
+		}	
+	}
+
+	//Fetch employee details from EmployeeService using Feign client
+	//@Retryable()
 	private EmployeeDto fetchEmployee(String empId) {
-		log.debug("Fetching employee details for empId = {}",empId);
+		log.debug("Fetching employee details for empId = {}",maskEmployeeId(empId)); //15
 		try {
 			EmployeeDto employee = employeeClient.getEmployeeById(empId);
 			if(employee == null ) {
-				log.error("Employee not found for empId: {}", empId);
+				log.error("Employee not found for empId: {}", maskEmployeeId(empId));
 				throw new EmployeeNotFoundException(empId);
 			}
 		return employee;			
-		} catch(Exception ex) {
+		} catch(FeignException.NotFound fe) {										//15
+			log.error("Employee not found for empId: {}", maskEmployeeId(empId));
+			throw new EmployeeNotFoundException(empId);
+			
+		}catch(Exception ex) {
 			log.error("Error fetching employee details for empId = {}",empId, ex);
 			throw new EmployeeNotFoundException(empId);
 		}		
+	}
+	//Validate and extract employee salary
+	private BigDecimal validateAndGetSalary(EmployeeDto employeeDto, String empId) {
+		BigDecimal empSalary = employeeDto.getEmpSalary();
+		if(empSalary == null || empSalary.compareTo(BigDecimal.ZERO) <= 0) {
+			log.error("Invalid employee salary for empId: {}", maskEmployeeId(empId));
+			throw new BonusCalculationException(INVALID_SALARY, " Employee salary must be greater than 0");
+		}			
+		return empSalary;
+	}
+	
+	//Validate and extract performance rating  
+
+	private Integer validateAndGetPerformanceRating(EmployeeDto employeeDto, String empId) {	//15
+		Integer rating = employeeDto.getEmpPerformanceRating();
+		
+		if (rating == null) {
+			log.error("Performance rating is null for empId: {}", maskEmployeeId(empId));
+			throw new BonusCalculationException(MISSING_PERFORMANCE_RATING, 
+				"Performance rating is required for bonus calculation");
+		}
+		
+		return rating;
 	}
 
 	private BigDecimal calculateExperienceBonus(BigDecimal empSalary, int empExperienceYears) {
@@ -170,14 +208,16 @@ public class BonusServiceImpl implements BonusService {
 		return empSalary.multiply(BigDecimal.valueOf(slabDesignation.getPercentage()));
 	}
 	
-	private BigDecimal calculatePerformanceBonus(BigDecimal empSalary, Integer empPerformanceRating) {
+	private BigDecimal calculatePerformanceBonus(BigDecimal empSalary, 
+												Integer empPerformanceRating) {
 		PerformanceBonusType slabRating = PerformanceBonusType.from(empPerformanceRating);
 		log.debug("Performance bonus type selected: {} ({}%)",slabRating.name(), slabRating.getPercentage());
 		return empSalary.multiply(BigDecimal.valueOf(slabRating.getPercentage()));
 	}
 	
-	private BigDecimal calculateTotalBonusBeforeTax(BigDecimal experienceBonus, BigDecimal designationBonus,
-			BigDecimal perormanceBonus) {		
+	private BigDecimal calculateTotalBonusBeforeTax(	BigDecimal experienceBonus, 
+													BigDecimal designationBonus,
+													BigDecimal perormanceBonus) {		
 		//BigDecimal.ZERO -> for NULL safety,
 		//BigDecimal.setScale(2, RoundingMode.HALF_UP) -> Round of 2 digits after decimal 
 		//(HALF_UP) -> rounding to the nearest neighbour -> (Example 10.234 = 10.23, 10.235 = 10.24, 49.9995 =  50.00)
@@ -236,7 +276,24 @@ public class BonusServiceImpl implements BonusService {
 								.multiply(ONE_HUNDRED)
 								.setScale(2, RoundingMode.HALF_UP);
 	}
-
+	
+	//Build bonus entity from calculated values 
+	private Bonus buildBonusEntity(String empId, BigDecimal experienceBonus, BigDecimal designationBonus,
+			BigDecimal perormanceBonus, BigDecimal totalBonusBeforeTax, BigDecimal taxAmount, BigDecimal netBonus,
+			BigDecimal bonusPercentage) {
+		return Bonus.builder()
+				.employeeId(empId)
+				.experienceBonus(experienceBonus)
+				.designationBonus(designationBonus)
+				.performanceBonus(perormanceBonus)
+				.totalBonusBeforeTax(totalBonusBeforeTax)
+				.taxDeducted(taxAmount)
+				.netBonus(netBonus)
+				.bonusPercentage(bonusPercentage)
+				.bonusDate(LocalDate.now())
+				.build();		
+				
+	}
 
 	@Override
 	@Transactional(readOnly = true)
@@ -266,6 +323,15 @@ public class BonusServiceImpl implements BonusService {
 		List<BonusDto> bonusList = bonusPage.stream().map(bonusMapper::toDto).collect(Collectors.toList());
 		log.info("Fetched {} bonuses in current page ", bonusList.size());		
 		return bonusList;
+	}
+	
+	//Mask employee id for secure logging (show only last 4 chars)
+	//rewardly-20251225-113528-4897 = ****4897
+	private String maskEmployeeId(String empId) {
+		if(empId == null || empId.length() <= 4) {
+			return "****";
+		}
+		return "****"+ empId.substring(empId.length() - 4);
 	}
 
 }

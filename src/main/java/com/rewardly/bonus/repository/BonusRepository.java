@@ -1,5 +1,6 @@
 package com.rewardly.bonus.repository;
 
+import java.time.LocalDate;
 import java.util.List;
 
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -16,6 +17,8 @@ public interface BonusRepository extends JpaRepository<Bonus, Long> {
 	
 	@Transactional
 	void deleteByEmployeeId(String empId);
+
+	boolean existsByEmployeeIdAndBonusDate(String empId, LocalDate bonusDate);
 	
 	
 

@@ -12,6 +12,10 @@ public class BonusCalculationException extends BaseException {
 		super(String.format("Bonus calculation failed: %s ", reason), ERROR_CODE, reason);		
 	}
 	
+	public BonusCalculationException(String errorCode, String reason) {
+		super(String.format("Bonus calculation failed: %s ", reason), errorCode , reason);		
+	}
+	
 	public BonusCalculationException(String reason , Throwable cause) {
 		super(String.format("Bonus calculation failed: %s ", reason), ERROR_CODE, cause);		
 	}
